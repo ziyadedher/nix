@@ -415,23 +415,76 @@ struct S3BinaryCacheStoreImpl : virtual S3BinaryCacheStoreConfig, public virtual
             uploadFile(path, istream, mimeType, "");
     }
 
-    void getFile(const std::string & path, Sink & sink) override
-    {
+    void getFile(const std::string & path, Sink & sink) override {
+        auto maxThreads = std::thread::hardware_concurrency();
+
+        static std::shared_ptr<Aws::Utils::Threading::PooledThreadExecutor>
+            executor = std::make_shared<Aws::Utils::Threading::PooledThreadExecutor>(maxThreads);
+
+        std::call_once(transferManagerCreated, [&]()
+        {
+            TransferManagerConfiguration transferConfig(executor.get());
+
+            transferConfig.s3Client = s3Helper.client;
+            transferConfig.bufferSize = bufferSize;
+
+            transferConfig.downloadProgressCallback =
+                [](const TransferManager *transferManager,
+                    const std::shared_ptr<const TransferHandle>
+                    &transferHandle)
+                {
+                    //FIXME: find a way to properly abort the download.
+                    //checkInterrupt();
+                    debug("download progress ('%s'): '%d' of '%d' bytes",
+                        transferHandle->GetKey(),
+                        transferHandle->GetBytesTransferred(),
+                        transferHandle->GetBytesTotalSize());
+                };
+
+            transferManager = TransferManager::Create(transferConfig);
+        });
+
+        auto now1 = std::chrono::steady_clock::now();
+
+        auto stream = std::make_shared<std::stringstream>();
+
+        Aws::Transfer::CreateDownloadStreamCallback writeToStreamFn = [&stream]() {
+            return stream.get();
+        };
+
+        std::shared_ptr<TransferHandle> transferHandle =
+            transferManager->DownloadFile(
+                bucketName, path, writeToStreamFn,
+                Aws::Transfer::DownloadConfiguration());
+
+        transferHandle->WaitUntilFinished();
+
+        if (transferHandle->GetStatus() == TransferStatus::FAILED)
+            throw Error("AWS error: failed to download 's3://%s/%s': %s",
+                bucketName, path, transferHandle->GetLastError().GetMessage());
+
+        if (transferHandle->GetStatus() != TransferStatus::COMPLETED)
+            throw Error("AWS error: transfer status of 's3://%s/%s' in unexpected state",
+                bucketName, path);
+
+        auto now2 = std::chrono::steady_clock::now();
+
+        auto duration =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now2 - now1)
+                .count();
+
+        auto size = transferHandle->GetBytesTransferred();
+
+        printInfo("downloaded 's3://%s/%s' (%d bytes) in %d ms",
+            bucketName, path, size, duration);
+
+        stats.getTimeMs += duration;
+        stats.getBytes += size;
         stats.get++;
 
-        // FIXME: stream output to sink.
-        auto res = s3Helper.getObject(bucketName, path);
-
-        stats.getBytes += res.data ? res.data->size() : 0;
-        stats.getTimeMs += res.durationMs;
-
-        if (res.data) {
-            printTalkative("downloaded 's3://%s/%s' (%d bytes) in %d ms",
-                bucketName, path, res.data->size(), res.durationMs);
-
-            sink(*res.data);
-        } else
-            throw NoSuchBinaryCacheFile("file '%s' does not exist in binary cache '%s'", path, getUri());
+        // Write the downloaded content to the sink
+        stream->seekg(0);
+        sink(stream->str());
     }
 
     StorePathSet queryAllValidPaths() override
